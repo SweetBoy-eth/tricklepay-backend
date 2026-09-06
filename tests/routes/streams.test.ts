@@ -305,6 +305,44 @@ describe("GET /streams offset ceiling", () => {
   });
 });
 
+describe("GET /streams invalid offset (#134)", () => {
+  it("treats a non-numeric offset as zero", async () => {
+    streamsRepo.listStreams.mockResolvedValue({ streams: [] });
+    const response = await listRequest("/streams?offset=abc");
+    expect(response.statusCode).toBe(200);
+    expect(streamsRepo.listStreams).toHaveBeenCalledWith(
+      expect.objectContaining({ offset: 0 }),
+    );
+  });
+
+  it("treats a negative offset as zero", async () => {
+    streamsRepo.listStreams.mockResolvedValue({ streams: [] });
+    const response = await listRequest("/streams?offset=-5");
+    expect(response.statusCode).toBe(200);
+    expect(streamsRepo.listStreams).toHaveBeenCalledWith(
+      expect.objectContaining({ offset: 0 }),
+    );
+  });
+
+  it("treats an empty string offset as zero", async () => {
+    streamsRepo.listStreams.mockResolvedValue({ streams: [] });
+    const response = await listRequest("/streams?offset=");
+    expect(response.statusCode).toBe(200);
+    expect(streamsRepo.listStreams).toHaveBeenCalledWith(
+      expect.objectContaining({ offset: 0 }),
+    );
+  });
+
+  it("treats a floating-point offset as truncated integer", async () => {
+    streamsRepo.listStreams.mockResolvedValue({ streams: [] });
+    const response = await listRequest("/streams?offset=3.7");
+    expect(response.statusCode).toBe(200);
+    expect(streamsRepo.listStreams).toHaveBeenCalledWith(
+      expect.objectContaining({ offset: 3 }),
+    );
+  });
+});
+
 describe("GET /streams includeTotal", () => {
   it("omits total and skips the count query by default", async () => {
     streamsRepo.listStreams.mockResolvedValue({ streams: [] });

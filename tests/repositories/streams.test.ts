@@ -12,7 +12,9 @@ import {
 import {
   countStreams,
   listStreams,
+  upsertStream,
   type StreamFilter,
+  type UpsertStreamInput,
 } from "../../src/repositories/streams.js";
 
 type StreamRow = Stream & {
@@ -214,5 +216,74 @@ describe("streams repository token filter", () => {
     expect(where).not.toHaveProperty("token");
     expect(where.sender).toBeDefined();
     expect(where.cancelled).toBe(true);
+  });
+});
+
+describe("streams repository upsert idempotency (#141)", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("applying the same stream twice leaves one row", async () => {
+    const input: UpsertStreamInput = {
+      streamId: 42n,
+      sender: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+      recipient: "GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H",
+      token: "CBFS2HT4TIHTMWA5ZND6FEC27BRRA4V6JWOD7JIIDZVSPVAM7EJ2LZS7",
+      totalAmount: 1000n,
+      withdrawn: 0n,
+      startTime: 1700000000n,
+      endTime: 1700003600n,
+      cliffTime: 1700000000n,
+      cancelled: false,
+      ledger: 100,
+      eventId: "0000000000000000001",
+    };
+
+    const upsert = vi.spyOn(prisma.stream, "upsert").mockResolvedValue({} as never);
+
+    await upsertStream(input);
+    await upsertStream(input);
+
+    expect(upsert).toHaveBeenCalledTimes(2);
+    expect(upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { streamId: 42n },
+      }),
+    );
+  });
+
+  it("second write does not corrupt stored values", async () => {
+    const input: UpsertStreamInput = {
+      streamId: 99n,
+      sender: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+      recipient: "GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H",
+      token: "CBFS2HT4TIHTMWA5ZND6FEC27BRRA4V6JWOD7JIIDZVSPVAM7EJ2LZS7",
+      totalAmount: 5000n,
+      withdrawn: 0n,
+      startTime: 1700000000n,
+      endTime: 1700003600n,
+      cliffTime: 1700000000n,
+      cancelled: false,
+      ledger: 100,
+      eventId: "0000000000000000001",
+    };
+
+    const upsert = vi.spyOn(prisma.stream, "upsert").mockResolvedValue({} as never);
+
+    await upsertStream(input);
+
+    const secondInput = { ...input, eventId: "0000000000000000002", ledger: 101 };
+    await upsertStream(secondInput);
+
+    expect(upsert).toHaveBeenCalledTimes(2);
+    expect(upsert).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        update: expect.objectContaining({
+          totalAmount: expect.any(Prisma.Decimal),
+          updatedLedger: 101,
+        }),
+      }),
+    );
   });
 });
