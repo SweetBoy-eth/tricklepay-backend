@@ -17,13 +17,20 @@ For a record of API and indexer behavior changes, see the [Changelog](CHANGELOG.
 ## Table of Contents
 
 - [How it works](#how-it-works)
+- [Database schema](#database-schema)
+- [Glossary](#glossary)
 - [API](#api)
+- [Error Responses](#error-responses)
+- [Health Endpoint Semantics](#health-endpoint-semantics)
+- [Metrics](#metrics)
 - [Running locally](#running-locally)
 - [Testing](#testing)
 - [Configuration](#configuration)
 - [Deployment](#deployment)
+- [Contributing](#contributing)
 - [Project structure](#project-structure)
 - [Frequently asked questions](#frequently-asked-questions)
+- [Troubleshooting](#troubleshooting)
 - [Related repositories](#related-repositories)
 - [License](#license)
 
@@ -76,8 +83,34 @@ using the same linear vesting formula the contract itself evaluates on-chain.
 That means these figures track wall-clock time rather than the last indexed
 event — a stream's `vested` amount can be higher on a second request than the
 first even though the indexer applied nothing in between — and they agree with
-what the contract would report if queried directly, without ever making that
-chain round-trip.
+## Database schema
+
+The service uses PostgreSQL via Prisma. Database state is divided into four tables:
+
+- **`Stream`**: Stores the current state of each indexed token stream (amounts as wide fixed-point decimals, schedule timestamps as Unix seconds). Updated idempotently using `lastEventId` to guard against duplicate or out-of-order event application.
+- **`IndexedEvent`**: An immutable log of raw decoded contract events (`Created`, `Withdrawn`, `Cancelled`) processed by the indexer.
+- **`FailedEvent`**: Records contract events that failed during processing or database application, allowing operators to inspect and retry failed events via `npm run replay-failed-events`.
+- **`IndexerState`**: Single-row bookkeeping table storing indexer progress (`lastLedger`), latest Stellar network height (`chainLedger`), and RPC paging position (`cursor`).
+
+### Entity Relationships
+
+- **`Stream` ↔ `IndexedEvent`**: `IndexedEvent` records raw event logs; applied events update `Stream` rows. `Stream.lastEventId` ensures delta updates apply idempotently.
+- **`Stream` ↔ `FailedEvent`**: `FailedEvent` logs unapplied events by `streamId` when available for debugging and retry.
+- **`IndexerState` ↔ `Stream` & `IndexedEvent`**: `IndexerState.lastLedger` records the block height through which all events and streams have been synced. `IndexerState.cursor` tracks the Soroban RPC event pagination marker.
+
+For full field descriptions, data types, indexes, and relationship details, see [docs/database-schema.md](docs/database-schema.md).
+
+## Glossary
+
+Core indexer terms used across code and documentation include:
+
+- **Cursor**: Opaque Soroban RPC pagination marker (`IndexerState.cursor`). Advances on every poll tick regardless of whether events were found.
+- **Ledger**: Sequential block height on the Stellar network (e.g. `lastLedger`, `chainLedger`).
+- **Backfill**: Indexer catch-up phase scanning historical events from an earlier ledger up to chain head.
+- **Lag**: Calculated difference in ledgers between chain height and indexer applied position (`chainLedger - lastLedger`).
+- **Applied Event**: Contract event whose state updates have been successfully persisted to PostgreSQL (`Stream` and `IndexedEvent`).
+
+For complete definitions and supporting terms, see [docs/glossary.md](docs/glossary.md).
 
 ## API
 
@@ -87,7 +120,20 @@ chain round-trip.
 | `GET` | `/health` | Liveness check. Returns 200 with the service version; performs no database read. |
 | `GET` | `/ready` | Readiness check. Verifies database connectivity and reports indexer lag; returns 503 when the database is unavailable. |
 | `GET` | `/status` | Indexer progress against the chain. |
-| `GET` | `/streams` | List streams. Query params: `sender`, `recipient`, `token`, `limit` (max 100), `offset` (max 10000), `includeTotal`, `cancelled`. Address filters accept lowercase and padded spellings and are normalized before matching. `total` is only included when `includeTotal=true`; `cancelled` filters by cancellation status when given, and is omitted to return both. |
+| `GET` | `/streams` | List streams. Query params: `sender`, `recipient`, `token`, `limit`, `offset`, `includeTotal`, `cancelled`, `cursor`. Address filters accept lowercase and padded spellings and are normalized before matching. `total` is only included when `includeTotal=true`; `cancelled` filters by cancellation status when given, and is omitted to return both. |
+
+### Pagination Parameters
+
+The `GET /streams` endpoint supports pagination through the following query parameters:
+
+| Parameter | Type | Default | Maximum | Description |
+|-----------|------|---------|---------|-------------|
+| `limit` | integer | 50 | 100 | Maximum number of streams to return per page |
+| `offset` | integer | 0 | 10,000 | Zero-based index of the first stream to return |
+| `cursor` | string | - | - | Opaque cursor from a previous response for stable pagination |
+| `includeTotal` | boolean | false | - | When `true`, includes the total count of matching streams |
+
+**Note:** When `cursor` is provided, `offset` is ignored and offset ceiling checks are skipped. Use cursor-based pagination for stable results under concurrent inserts.
 | `GET` | `/streams/summary` | Counts and exact amount totals per status (`pending`, `streaming`, `completed`, `cancelled`). |
 | `GET` | `/streams/:id` | A single stream by id. |
 | `GET` | `/metrics` | Prometheus metrics. |
@@ -116,16 +162,179 @@ separate figures, because only the distance between them means anything:
     "updatedAt": "2025-11-14T03:00:00.000Z"
   },
   "chain": { "latestLedger": 56999999 },
-  "lagLedgers": 709986
+  "lagLedgers": 709986,
+  "failedEventCount": 0
 }
 ```
 
-`indexer.lastLedger` is the highest ledger whose events have been applied, so a
-backfill reads as behind for as long as it is behind. Both figures are as of the
-last completed poll — the API never queries the chain — and `updatedAt` says
-when that was, which is how a stalled indexer, whose lag stops growing, is told
-apart from one that is genuinely level. `lagLedgers` is null until the first
-poll has recorded something to measure.
+**Field reference**
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `indexer.initialized` | boolean | `true` once the indexer has completed its first poll and recorded a position. `false` before that — the API returns zeros for the other fields in this state. |
+| `indexer.lastLedger` | number | Highest ledger sequence whose events have been fully applied to the database. Only advances when an event is actually written; a poll that finds no events leaves it unchanged. |
+| `indexer.cursor` | string \| null | Opaque Soroban RPC paging token. The indexer resumes from this token on the next poll. Advances on every poll — including empty ones — so it must not be compared to the chain head to derive lag. `null` before the first poll. |
+| `indexer.updatedAt` | string \| null | ISO-8601 timestamp of when the position was last written. A lag that stops growing combined with a stale `updatedAt` indicates a stalled indexer; a growing `updatedAt` with a steady lag indicates a caught-up indexer on a quiet chain. `null` before the first poll. |
+| `chain.latestLedger` | number | The chain's head ledger as of the indexer's last completed poll. The API never queries the chain directly — this value is read from Postgres, where the poller stored it. |
+| `lagLedgers` | number \| null | `chain.latestLedger - indexer.lastLedger`. The number of ledgers between the chain head and the indexer's position. `null` before the first poll. Never negative. |
+| `failedEventCount` | number | Count of contract events that could not be applied and remain in the `FailedEvent` table. A non-zero value signals events that need operator attention or replay (see [Failed-event replay](#failed-event-replay)). |
+
+**What `lagLedgers` is**
+
+`lagLedgers` is the *gap since the last processed event* — the distance between the chain's head and the highest ledger the indexer actually applied. It tells you how far the indexer's mirror is behind the chain as of the last poll.
+
+**What `lagLedgers` is not**
+
+It is *not* a measure of indexing delay or processing latency. A chain that has produced no new events since the last poll still reports a non-zero lag if the indexer started from an older ledger. Conversely, a freshly started indexer that has caught up to the head will report zero lag even if the poll took several seconds. The figure only changes when either the chain produces a new ledger or the indexer applies an event — it is a positional gap, not a time-based metric.
+
+Both figures are as of the last completed poll — the API never queries the chain — and `updatedAt` says when that was, which is how a stalled indexer, whose lag stops growing, is told apart from one that is genuinely level. `lagLedgers` is null until the first poll has recorded something to measure.
+
+## Error Responses
+
+All error responses follow a consistent JSON shape:
+
+```json
+{
+  "code": "VALIDATION_ERROR",
+  "error": "invalid stream id",
+  "requestId": "req-1"
+}
+```
+
+### Error Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `code` | string | Machine-readable error category |
+| `error` | string | Human-readable error message |
+| `requestId` | string | Request id from `x-request-id` header, for matching to server logs |
+
+### Error Codes
+
+| Code | HTTP Status | Description |
+|------|-------------|-------------|
+| `VALIDATION_ERROR` | 400 | Invalid input parameters or malformed request |
+| `NOT_FOUND` | 404 | Requested resource does not exist |
+| `REQUEST_ERROR` | 400 | General client-side request error |
+| `INTERNAL_SERVER_ERROR` | 500 | Server-side failure (see server logs with requestId) |
+
+### Example Error
+
+```bash
+curl -s http://localhost:3000/streams/invalid | jq
+```
+
+```json
+{
+  "code": "VALIDATION_ERROR",
+  "error": "invalid stream id",
+  "requestId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+}
+```
+
+## Health Endpoint Semantics
+
+The service exposes two health endpoints that answer different questions. Wire them to separate probes in your orchestration platform.
+
+### Liveness — `GET /health`
+
+**What it checks:** Whether the Node.js process is running and responsive.
+
+**What it deliberately does NOT check:**
+- Database connectivity
+- Indexer status
+- Chain connectivity
+- Any external dependency
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "version": "1.0.0"
+}
+```
+
+**Intended use:** This is a **liveness probe**. Use it to detect when the process itself is wedged (e.g., deadlocked, crashed, or otherwise unresponsive). If this endpoint stops responding, your orchestration platform should restart the container. The endpoint performs no I/O — it returns immediately from memory — so it stays green even when the database is unreachable or the chain is down.
+
+### Readiness — `GET /ready`
+
+**What it checks:**
+1. Database connectivity (can reach Postgres)
+2. Indexer lag (how far behind the chain)
+
+**What it does NOT check:**
+- Chain connectivity
+- Whether the indexer is currently running
+
+**Response (healthy):**
+```json
+{
+  "status": "ready",
+  "database": "up",
+  "indexer": {
+    "lagLedgers": 1234
+  }
+}
+```
+
+**Response (unhealthy):**
+```json
+{
+  "status": "not_ready",
+  "database": "down",
+  "error": "Connection refused"
+}
+```
+
+**Intended use:** This is a **readiness probe**. Use it to determine whether the instance should receive traffic. If this returns 503, take the instance out of load-balancer rotation — the process is fine, but a dependency isn't. Do NOT restart the container on a readiness failure; wait for the dependency to recover.
+
+### Why Separate Probes?
+
+| Probe | Fires When | Action |
+|-------|------------|--------|
+| Liveness (`/health`) | Process is unresponsive | Restart container |
+| Readiness (`/ready`) | Database unreachable | Remove from rotation, do not restart |
+
+## Metrics
+
+The service exposes Prometheus metrics at `/metrics`. Scrape this endpoint from a Prometheus instance or a compatible collector (Grafana Alloy, Victoria Metrics, etc.).
+
+### Indexer Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `tricklepay_indexer_events_applied` | Counter | `kind`, `outcome` | Total contract events applied to the database |
+| `tricklepay_indexer_pages_fetched` | Counter | — | Total event pages fetched from the Soroban RPC |
+| `tricklepay_rpc_errors` | Counter | `operation` | Total Soroban RPC calls that resulted in an error |
+| `tricklepay_indexer_poll_errors` | Counter | — | Total poll iterations that failed with an unhandled error |
+| `tricklepay_indexer_poll_success_total` | Counter | — | Total successful indexer poll iterations |
+| `tricklepay_indexer_events_failed` | Counter | `kind` | Total individual events that failed to apply and were skipped |
+| `tricklepay_indexer_lag_ledgers` | Gauge | — | Gap between the chain's latest ledger and the highest ledger the indexer has applied (-1 before first poll) |
+| `tricklepay_indexer_poll_last_success_timestamp_seconds` | Gauge | — | Unix timestamp of the last successful poll (0 before first success) |
+
+### HTTP Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `tricklepay_http_requests_total` | Counter | `method`, `route`, `status` | Total HTTP requests handled |
+| `tricklepay_http_request_duration_ms` | Histogram | `method`, `route`, `status` | HTTP request duration in milliseconds (buckets: 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000) |
+
+### Example PromQL Queries
+
+**Poll throughput:**
+```promql
+rate(tricklepay_indexer_poll_success_total[5m])
+```
+
+**Stalled poller alert (no successful poll in 5 minutes):**
+```promql
+tricklepay_indexer_poll_last_success_timestamp_seconds < time() - 300
+```
+
+**HTTP request error rate:**
+```promql
+sum(rate(tricklepay_http_requests_total{status=~"5.."}[5m])) / sum(rate(tricklepay_http_requests_total[5m]))
+```
 
 ## Running locally
 
@@ -138,13 +347,133 @@ npm install
 ./scripts/dev.sh            # starts Postgres, syncs schema, runs with reload
 ```
 
-Or run everything in containers:
+### Running with Docker Compose
+
+The repository includes a multi-container setup in `docker-compose.yml` that starts both the PostgreSQL database and the API service (which automatically runs pending database migrations on startup).
+
+#### Environment Variables for Docker
+
+When running with Docker Compose, the service requires or configures the following environment variables:
+
+| Variable | Required | Description / Default |
+| --- | --- | --- |
+| `STREAM_CONTRACT_ID` | **Yes** | Deployed Soroban contract address (56 characters starting with `C`). Must be provided in `.env` or set in shell environment. |
+| `DATABASE_URL` | Yes | Pre-configured in compose to `postgresql://tricklepay:tricklepay@postgres:5432/tricklepay`. |
+| `NETWORK` | No | Stellar network (`testnet` or `mainnet`). Default in compose: `testnet`. |
+| `PORT` | No | Container HTTP listen port. Default: `3000`. |
+| `HOST` | No | Container listen address. Default: `0.0.0.0`. |
+
+#### Step-by-Step Instructions from a Clean Checkout
+
+1. **Clone the repository and prepare environment configuration:**
+
+   ```bash
+   cp .env.example .env
+   ```
+
+   Edit `.env` and set `STREAM_CONTRACT_ID` to your deployed stream contract address (e.g., `STREAM_CONTRACT_ID=C...`).
+
+2. **Start the database and API containers:**
+
+   ```bash
+   docker compose up --build
+   ```
+
+   To run the stack in detached (background) mode, use:
+
+   ```bash
+   docker compose up -d
+   ```
+
+   The `api` container waits for the `postgres` healthcheck to pass, runs `npx prisma migrate deploy` automatically, and then starts the API service.
+
+3. **Verify and view logs:**
+
+   ```bash
+   docker compose logs -f api
+   ```
+
+   The API endpoint will be available at `http://localhost:3000`.
+
+4. **Stop the stack:**
+
+   ```bash
+   docker compose down
+   ```
+
+   To stop the stack and delete the persistent PostgreSQL volume (`pgdata`), pass the `-v` flag:
+
+   ```bash
+   docker compose down -v
+   ```
+
+#### Building and Running with Standalone Docker
+
+If you already have a PostgreSQL instance running, you can build and run the backend image directly:
 
 ```bash
-STREAM_CONTRACT_ID=C... docker compose up
+# Build the Docker image
+docker build -t tricklepay-backend .
+
+# Run the container
+docker run -d \
+  --name tricklepay-api \
+  -e DATABASE_URL="postgresql://tricklepay:tricklepay@host.docker.internal:5432/tricklepay" \
+  -e STREAM_CONTRACT_ID="C..." \
+  -p 3000:3000 \
+  tricklepay-backend
 ```
 
-The API listens on `http://localhost:3000`.
+## Failed events table
+
+The `FailedEvent` table is the indexer's operator-facing safety net. When an
+individual event cannot be decoded or applied, the poller records a row so the
+rest of the page can continue without stopping indexing. Each row stores:
+
+- `eventId`: the Soroban RPC `TOID-index` that uniquely identifies the event
+- `kind`: the decoded event kind, or `"unknown"` if decoding failed first
+- `streamId`: the target stream, when available, encoded as a string
+- `ledger`: the ledger in which the event was observed
+- `error`: the most recent exception text from the failed attempt
+- `failureCount`: how many times this event has failed
+- `firstFailedAt` / `lastFailedAt`: timestamps for the first and latest failure
+
+The row is upserted on each failure, so repeated attempts refresh the error and
+increment `failureCount` without creating duplicate rows. A successful replay or a
+subsequent clean apply clears the record.
+
+### Inspecting failed events
+
+You can inspect the table directly with PostgreSQL or by using the built-in
+replay command as a dry run:
+
+```bash
+# see the oldest unresolved failures first
+psql "$DATABASE_URL" -c 'SELECT "eventId", "kind", "streamId", "ledger", "failureCount", "error" FROM "FailedEvent" ORDER BY "ledger" ASC LIMIT 20;'
+
+# count unresolved failures
+psql "$DATABASE_URL" -c 'SELECT COUNT(*) FROM "FailedEvent";'
+
+# preview the next 20 failed rows without changing state
+npm run replay-failed-events -- --dry-run --limit 20
+```
+
+The SQL view is useful when you need to trace the exact failed event, ledger,
+and exception text. The replay command is useful when you want a bounded retry
+without waiting for a full poller sweep.
+
+### Cursor behavior on a failed event
+
+When a single event fails, the indexer does not stop the page or rewind the
+cursor. It logs the error, records the failed row, and continues processing the
+remaining events in the same page. The cursor is saved only after the page is
+finished and `saveIndexerPosition` runs, so the next poll resumes from the page's
+cursor rather than from the bad event itself.
+
+`lastLedger` is advanced only after a successful apply, which means a failed
+event never counts as processed. In other words, one bad event is skipped, the
+cursor still advances past that page, and the indexer continues without being
+left stranded behind a single invalid record.
 
 ## Failed-event replay
 
@@ -166,6 +495,10 @@ it succeeds, and keeps the retry set bounded so one permanently invalid event
 cannot stall the rest.
 
 ## Contributing
+
+For instructions on setting up your local environment, running required checks (`npm run typecheck`, `npm test`, `npm run build`), and submitting pull requests, see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+For global contributor guidelines across the organization, refer to the shared [TricklePay Documentation Guide](https://github.com/TricklePay/tricklepay-docs).
 
 ### Import ordering
 
@@ -220,17 +553,25 @@ projects and may produce unexpected results.
 ## Configuration
 
 All configuration is read from the environment; `.env.example` is the complete,
-current template — copy it and fill in the required values. The only required
-variables are `DATABASE_URL` and `STREAM_CONTRACT_ID`.
+current template — copy it and fill in the required values.
 
-Everything else is optional, and the template lists each with its default:
-the network defaults to testnet, the RPC URL to the public endpoint for the
-selected network (`SOROBAN_RPC_URL` to override), the server listens on
-`PORT`/`HOST`, and `CORS_ORIGIN` pins which browser origin may call the API.
-`LOG_LEVEL` sets log verbosity, `BODY_LIMIT` and `QUERY_STRING_LIMIT` bound
-request sizes. The indexer polls every `INDEXER_POLL_INTERVAL_MS` (minimum
-1000) starting from `INDEXER_START_LEDGER` — zero means start at the chain's
-latest ledger rather than replaying history. On repeated RPC failures the retry delay doubles each time up to `INDEXER_BACKOFF_MAX_MS` (default 60000), then resets to the normal interval after a successful poll, so a struggling endpoint is not hammered on a fixed schedule. `INDEXER_MAX_PAGES_PER_TICK` (default 1000) caps how many event pages one poll fetches, so a deep backlog is spread across ticks; the cursor is saved after each page so progress is kept.
+| Variable | Required | Default | Description |
+| --- | --- | --- | --- |
+| `DATABASE_URL` | **Yes** | - | Postgres connection string. |
+| `STREAM_CONTRACT_ID` | **Yes** | - | Deployed Soroban contract address. |
+| `NETWORK` | No | `testnet` | Stellar network (`testnet` or `mainnet`). |
+| `SOROBAN_RPC_URL` | No | *network dependent* | Soroban RPC endpoint. Defaults to the public endpoint for the selected network. |
+| `PORT` | No | `3000` | HTTP server listen port. |
+| `HOST` | No | `0.0.0.0` | HTTP server bind address. |
+| `CORS_ORIGIN` | No | - | Allowed browser origin for the web client. |
+| `LOG_LEVEL` | No | `info` | Log verbosity (`trace`, `debug`, `info`, `warn`, `error`, `fatal`). |
+| `BODY_LIMIT` | No | `1048576` | Largest accepted request body in bytes. |
+| `QUERY_STRING_LIMIT` | No | `2048` | Longest accepted URL query string in bytes. |
+| `TRUSTED_PROXIES` | No | - | Comma-separated list of trusted reverse-proxy addresses. |
+| `INDEXER_POLL_INTERVAL_MS` | No | `5000` | Milliseconds between polls of the chain. |
+| `INDEXER_BACKOFF_MAX_MS` | No | `60000` | Maximum poll retry delay (ms) on RPC failures. |
+| `INDEXER_START_LEDGER` | No | `0` | Ledger to begin indexing from. `0` starts at the chain's latest ledger. |
+| `INDEXER_MAX_PAGES_PER_TICK` | No | `1000` | Maximum number of event pages fetched per poll tick. |
 
 ### Logging
 
@@ -495,12 +836,212 @@ interactive and intended for local development only. The
 [Deployment — Migrations](#migrations) section shows the recommended patterns
 for init-containers and pre-deploy hooks.
 
+## Troubleshooting
+
+### Database not running
+
+**Error text:**
+
+```
+Database connectivity check failed: connection refused
+```
+
+or
+
+```
+PrismaClientKnownRequestError: Error in PostgreSQL connection pool: server closed the connection unexpectedly
+```
+
+**Cause:** The PostgreSQL database is not running or is not reachable at the address specified in `DATABASE_URL`.
+
+**Fix:**
+
+1. If using Docker Compose, start the database:
+   ```bash
+   docker compose up -d postgres
+   ```
+
+2. Verify the database is running:
+   ```bash
+   docker compose ps postgres
+   ```
+
+3. Check that `DATABASE_URL` in your `.env` file matches the Docker Compose configuration:
+   ```
+   DATABASE_URL=postgresql://tricklepay:tricklepay@localhost:5432/tricklepay
+   ```
+
+4. If the database is running but still unreachable, check that the port is not blocked and the container is healthy.
+
+---
+
+### Missing contract id
+
+**Error text:**
+
+```
+Missing required environment variable: STREAM_CONTRACT_ID
+```
+
+or
+
+```
+Configuration error: STREAM_CONTRACT_ID is required
+```
+
+**Cause:** The `STREAM_CONTRACT_ID` environment variable is not set. This is the only required variable besides `DATABASE_URL`.
+
+**Fix:**
+
+1. Copy the example environment file:
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Edit `.env` and set `STREAM_CONTRACT_ID` to the deployed contract address:
+   ```
+   STREAM_CONTRACT_ID=C... (your deployed contract id)
+   ```
+
+3. The contract id starts with `C` and is obtained after deploying the Soroban streaming contract. See the [contracts](https://github.com/TricklePay/tricklepay-contracts) repository for deployment instructions.
+
+---
+
+### Prisma client not generated
+
+**Error text:**
+
+```
+TypeError: Cannot find module '@prisma/client'
+```
+
+or
+
+```
+Error: @prisma/client did not initialize yet. Please run "prisma generate"
+```
+
+**Cause:** The Prisma client has not been generated from the schema. This is required before the application can interact with the database.
+
+**Fix:**
+
+1. Generate the Prisma client:
+   ```bash
+   npx prisma generate
+   ```
+
+2. If you also need to apply database migrations (required for a fresh database):
+   ```bash
+   npx prisma migrate deploy
+   ```
+
+3. The `scripts/dev.sh` script runs both steps automatically, so if you use that script you should not encounter this issue.
+
+---
+
+### TypeScript compilation errors
+
+**Error text:**
+
+```
+error TSxxxx: Cannot find name '...'
+```
+
+or
+
+```
+error TSxxxx: Type '...' is not assignable to type '...'
+```
+
+**Cause:** The codebase has TypeScript errors that prevent compilation.
+
+**Fix:**
+
+1. Run the type checker to see all errors:
+   ```bash
+   npm run typecheck
+   ```
+
+2. Ensure you have the correct Node.js version:
+   ```bash
+   nvm use
+   ```
+
+3. Reinstall dependencies if needed:
+   ```bash
+   rm -rf node_modules
+   npm install
+   ```
+
+---
+
+### Port already in use
+
+**Error text:**
+
+```
+Error: listen EADDRINUSE: address already in use :::3000
+```
+
+**Cause:** Another process is already using port 3000 (the default API port).
+
+**Fix:**
+
+1. Find the process using the port:
+   ```bash
+   lsof -i :3000
+   ```
+
+2. Either stop the other process or configure a different port in your `.env`:
+   ```
+   PORT=3001
+   ```
+
+---
+
+### Tests failing
+
+**Error text:**
+
+```
+FAIL tests/...
+AssertionError: expected ... to equal ...
+```
+
+**Cause:** Tests are failing, possibly due to environment issues or code changes.
+
+**Fix:**
+
+1. Run the full test suite:
+   ```bash
+   npm test
+   ```
+
+2. Run the type checker first to ensure no type errors:
+   ```bash
+   npm run typecheck
+   ```
+
+3. Check that your environment is set up correctly (database running, migrations applied).
+
+4. If a specific test is failing, run only that test file:
+   ```bash
+   npx vitest run --project unit tests/path/to/test.test.ts
+   ```
+
 ## Related repositories
 
 - **tricklepay-contracts** — the Soroban streaming contract this service indexes.
 - **tricklepay-frontend** — web client built on this API.
 - **tricklepay-docs** — architecture, security model, and contributor guides.
 
+## Contributing
+
+Contributions are welcome! Please review [CONTRIBUTING.md](CONTRIBUTING.md) for setup and development guidelines.
+
+All contributors are expected to adhere to the project's [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
+

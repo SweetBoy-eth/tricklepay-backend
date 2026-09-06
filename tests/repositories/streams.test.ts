@@ -10,6 +10,7 @@ import {
   recordFailedEvent,
 } from "../../src/repositories/failed-events.js";
 import {
+  applyWithdrawal,
   countStreams,
   listStreams,
   upsertStream,
